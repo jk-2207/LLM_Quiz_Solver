@@ -1,0 +1,8 @@
+openai
+huggingface_hub
+pandas
+playwright
+beautifulsoup4
+fastapi
+uvicorn[standard]
+requests
