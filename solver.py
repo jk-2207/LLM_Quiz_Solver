@@ -210,24 +210,27 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     url = quiz_info["url"]
 
     try:
+        # Try full JS rendering
         rendered_html = await render_with_js(url)
-    except NotImplementedError:
-        # Fallback: just use plain HTML if Playwright can’t run
+        soup = BeautifulSoup(rendered_html, "html.parser")
+    except Exception:
+        # Fallback: no JS, just plain HTML
         html = fetch_html(url)
         soup = BeautifulSoup(html, "html.parser")
-    else:
-        soup = BeautifulSoup(rendered_html, "html.parser")
 
     q_div = soup.find("div", {"id": "question"})
     text = q_div.get_text(" ", strip=True) if q_div else soup.get_text(" ", strip=True)
 
     if not text:
+        # At least this is a clear error, not a Playwright stack trace
         raise ValueError("JS-rendered page has no visible text")
 
+    # Try obvious "secret/code" pattern
     match = re.search(r"(secret|code)\s*[:\s]*([0-9]+)", text, re.IGNORECASE)
     if match:
         return match.group(2)
 
+    # Fallback: let the LLM extract the answer from the rendered text
     prompt = f"""
     Extract the final answer from this content:
 
@@ -237,7 +240,6 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     """
     answer = call_llm(prompt.strip(), system="Answer extractor")
     return answer.strip().splitlines()[0].strip()
-
 
 async def solve_api_quiz(quiz_info: Dict[str, Any]) -> Any:
     text = quiz_info.get("question_text", "")
