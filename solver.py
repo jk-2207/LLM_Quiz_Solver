@@ -209,8 +209,14 @@ async def compute_answer(quiz_info: Dict[str, Any]) -> Any:
 async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     url = quiz_info["url"]
 
-    rendered_html = await render_with_js(url)
-    soup = BeautifulSoup(rendered_html, "html.parser")
+    try:
+        rendered_html = await render_with_js(url)
+    except NotImplementedError:
+        # Fallback: just use plain HTML if Playwright can’t run
+        html = fetch_html(url)
+        soup = BeautifulSoup(html, "html.parser")
+    else:
+        soup = BeautifulSoup(rendered_html, "html.parser")
 
     q_div = soup.find("div", {"id": "question"})
     text = q_div.get_text(" ", strip=True) if q_div else soup.get_text(" ", strip=True)
@@ -218,12 +224,10 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     if not text:
         raise ValueError("JS-rendered page has no visible text")
 
-    # Detect secret/code-like patterns
     match = re.search(r"(secret|code)\s*[:\s]*([0-9]+)", text, re.IGNORECASE)
     if match:
         return match.group(2)
 
-    # Fallback: let LLM extract answer
     prompt = f"""
     Extract the final answer from this content:
 
@@ -232,7 +236,6 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     Respond ONLY with the answer value.
     """
     answer = call_llm(prompt.strip(), system="Answer extractor")
-
     return answer.strip().splitlines()[0].strip()
 
 
