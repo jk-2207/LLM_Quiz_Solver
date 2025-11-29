@@ -7,7 +7,9 @@ from solver import solve_quiz_chain
 
 app = FastAPI(title="TDS Quiz Solver – Orchestrator")
 
-QUIZ_SECRET = os.getenv("QUIZ_SECRET", "jk_tds_2025_secret")
+QUIZ_SECRET = os.getenv("QUIZ_SECRET")
+if not QUIZ_SECRET:
+    raise RuntimeError("QUIZ_SECRET must be set in the environment")
 QUIZ_EMAIL = os.getenv("QUIZ_EMAIL", "24f3000312@ds.study.iitm.ac.in")
 
 
