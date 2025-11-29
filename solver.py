@@ -665,36 +665,114 @@ Respond with valid JSON only.
     except Exception as e:
         raise ValueError(f"Failed to execute plan: {e}")
 
+import json  # ensure json is imported at top of file (you may already have it)
+
 async def solve_visualization_quiz(quiz_info: Dict[str, Any]) -> Any:
-    text = quiz_info.get("question_text", "")
-
-    prompt = f"""
-    Question:
-    {text}
-
-    Suggest visualization type and axes.
     """
-    chart_plan = call_llm(prompt.strip(), system="Visualization assistant")
+    Ask the LLM for a compact visualization plan (JSON). If the plan requests an image
+    and generate_chart_placeholder is available, attempt to produce a Base64 image and return it.
+    Otherwise return a sanitized textual plan.
+    Expected LLM JSON format:
+    {
+      "type":"bar"|"line"|"scatter"|"pie",
+      "x":"ColumnName",
+      "y":"ColumnName",
+      "title":"Optional title",
+      "want_image": true|false
+    }
+    """
+    text = quiz_info.get("question_text", "")
+    # instruct LLM to return JSON only
+    prompt = f"""
+You are a visualization assistant. The question:
+{text}
 
-    return f"[VISUALIZATION_PLAN] {chart_plan}"
+Return ONLY a compact JSON object that describes a visualization plan.
+Example:
+{{"type":"bar","x":"Month","y":"Sales","title":"Monthly Sales","want_image":true}}
 
+Allowed types: bar, line, scatter, pie.
+Respond with valid JSON only and nothing else.
+"""
+    raw = call_llm(prompt.strip(), system="Visualization assistant (json)")
+    cleaned = sanitize_answer(raw)
+
+    # Try parse JSON
+    try:
+        plan = json.loads(cleaned)
+    except Exception:
+        # If LLM didn't return JSON, fall back to returning its sanitized text
+        return "[VISUALIZATION_PLAN] " + cleaned
+
+    # If plan requests an image and helper exists, try to generate a chart image
+    want_image = bool(plan.get("want_image", False))
+    if want_image:
+        try:
+            # generate_chart_placeholder should accept a plan and return a Base64 URI or bytes.
+            # If your helper has a different signature, adapt accordingly.
+            image_result = generate_chart_placeholder(plan)
+            # If generate_chart_placeholder returns bytes or a data URI, sanitize and return
+            if isinstance(image_result, bytes):
+                import base64
+                b64 = base64.b64encode(image_result).decode("ascii")
+                return f"data:image/png;base64,{b64}"
+            # if it's already a string (base64 URI or path), return directly
+            return str(image_result)
+        except Exception:
+            # fallback to returning the JSON plan string
+            return "[VISUALIZATION_PLAN] " + sanitize_answer(json.dumps(plan))
+
+    # If no image requested, return the plan string (sanitized)
+    return "[VISUALIZATION_PLAN] " + sanitize_answer(json.dumps(plan))
 
 async def solve_text_reasoning_quiz(quiz_info: Dict[str, Any]) -> Any:
     text = quiz_info.get("question_text", "")
     url = quiz_info.get("url", "")
 
     prompt = f"""
-    URL: {url}
+URL: {url}
 
-    Question:
-    {text}
+Question:
+{text}
 
-    Respond ONLY with the final answer.
-    """
-    answer = call_llm(prompt.strip(), system="Quiz solver")
+You MUST respond ONLY with the final answer, and nothing else.
+If the answer is a number, return the number only (no text).
+If the answer is yes/no, return true or false.
+If the answer is structured, return JSON.
+"""
+    raw = call_llm(prompt.strip(), system="Quiz solver (strict)")
+    cleaned = sanitize_answer(raw)
 
-    return sanitize_answer(answer)
+    # Try to coerce into number, bool, or JSON if possible
+    # 1) boolean 'true'/'false'
+    low = cleaned.lower()
+    if low in {"true", "false", "yes", "no"}:
+        return True if low in {"true", "yes"} else False
 
+    # 2) integer
+    try:
+        if re.fullmatch(r"[-+]?\d+", cleaned):
+            return int(cleaned)
+    except Exception:
+        pass
+
+    # 3) float
+    try:
+        if re.fullmatch(r"[-+]?\d*\.\d+(e[-+]?\d+)?", cleaned, flags=re.I) or re.fullmatch(r"[-+]?\d+(\.\d*)?[eE][-+]?\d+", cleaned):
+            return float(cleaned)
+    except Exception:
+        pass
+
+    # 4) JSON
+    try:
+        import json as _json
+        parsed = _json.loads(cleaned)
+        return parsed
+    except Exception:
+        pass
+
+    # fallback: return sanitized string
+    return cleaned
 
 # ==========================================================
 # SUBMISSION FUNCTION
