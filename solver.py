@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 import requests
 from bs4 import BeautifulSoup  # type: ignore
@@ -18,6 +18,57 @@ from tools import (
     generate_chart_placeholder,
 )
 from llm_client import call_llm
+
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def _clean_label(raw: str) -> str:
+    """Return a cleaned classifier label (first token, stripped punctuation)."""
+    if not raw:
+        return ""
+    token = raw.strip().split()[0].lower().strip('.,;"\'()[]')
+    return token
+
+
+def sanitize_answer(ans: Optional[str]) -> str:
+    """
+    Normalize LLM outputs to a concise final answer string.
+    - Take the first non-empty line.
+    - Strip common prefixes like "answer is".
+    - Remove surrounding quotes.
+    """
+    if not ans:
+        return ""
+    s = str(ans).strip()
+    lines = [l.strip() for l in s.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    first = lines[0]
+    # Remove common prefixes
+    first = re.sub(r'(?i)^(answer[:\s-]*|the answer (is|:)\s*)', '', first).strip()
+    # Remove enclosing quotes or stray punctuation
+    first = first.strip().strip('"\'' )
+    return first
+
+
+def retry_post(url: str, json_payload: Dict[str, Any], retries: int = 2, backoff: float = 1.0, timeout: int = 20):
+    """
+    Simple retry wrapper for requests.post. Raises last exception on failure.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(url, json=json_payload, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except Exception as e:
+            last_exc = e
+            if attempt == retries:
+                raise
+            time.sleep(backoff * (2 ** attempt))
+    raise last_exc
 
 
 # ==========================================================
@@ -41,6 +92,10 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
             return {"status": "max_limit_reached", "solved": solved, "history": history}
 
         html = fetch_html(current_url)
+        if not html:
+            history.append({"url": current_url, "error": "failed_fetch_html"})
+            break
+
         quiz_info = parse_quiz_page(html, current_url)
 
         # Ensure email is always present
@@ -53,23 +108,26 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
             history.append({"url": current_url, "error": str(e)})
             break
 
+        # sanitize answer before submission
+        safe_answer = sanitize_answer(answer)
+
         resp = submit_answer(
             email=email,
             secret=secret,
             quiz_url=current_url,
-            answer=answer,
+            answer=safe_answer,
             submission_url=quiz_info["submission_url"],
         )
 
         history.append({
             "url": current_url,
-            "answer": answer,
-            "correct": resp.get("correct"),
+            "answer": safe_answer,
+            "correct": resp.get("correct", False),
             "next_url": resp.get("url"),
             "reason": resp.get("reason", "")
         })
 
-        # ✅ Only count as solved if correct
+        # Only increment solved when the judge says correct==true
         if resp.get("correct"):
             solved += 1
 
@@ -87,6 +145,13 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
 # ==========================================================
 
 def parse_quiz_page(html: str, url: str) -> Dict[str, Any]:
+    """
+    Parse the quiz page to extract:
+    - question_text
+    - has_js_module flag
+    - submission_url (absolute if possible)
+    - email (if present in URL)
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     # Extract question
@@ -110,24 +175,43 @@ def parse_quiz_page(html: str, url: str) -> Dict[str, Any]:
     email = qs.get("email", [None])[0]
 
     # ----------------- Detect submission URL -----------------
-
     submission_url = None
 
     # Case 1: <form action="...">
     form = soup.find("form")
     if form and form.get("action"):
-        submission_url = form.get("action")
+        submission_url = urljoin(url, form.get("action"))
 
-    # Case 2: JavaScript or text containing /submit
+    # Case 2: check <a href="..."> links and button formaction
     if not submission_url:
-        for tag in soup.find_all(["a", "script"], string=True):
-            if tag.string and "/submit" in tag.string:
-                match = re.search(r"https?://[^\"' ]+/submit", tag.string)
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            if "/submit" in href:
+                submission_url = urljoin(url, href)
+                break
+
+    if not submission_url:
+        for b in soup.find_all(["button", "input"], {"formaction": True}):
+            fa = b.get("formaction")
+            if fa and "/submit" in fa:
+                submission_url = urljoin(url, fa)
+                break
+
+    # Case 3: look inside script / text nodes for an absolute /submit URL
+    if not submission_url:
+        for tag in soup.find_all(["script", "div", "span"]):
+            txt = ""
+            if tag.string:
+                txt = tag.string
+            else:
+                txt = tag.get_text(" ", strip=True) or ""
+            if "/submit" in txt:
+                match = re.search(r"https?://[^\"' ]+/submit", txt)
                 if match:
                     submission_url = match.group(0)
                     break
 
-    # Case 3: Fallback to same domain + /submit
+    # Case 4: fallback to same domain + /submit
     if not submission_url:
         parsed_base = urlparse(url)
         submission_url = f"{parsed_base.scheme}://{parsed_base.netloc}/submit"
@@ -150,7 +234,7 @@ def detect_quiz_type(quiz_info: Dict[str, Any]) -> str:
     text = (quiz_info.get("question_text") or "").lower()
     has_js_module = quiz_info.get("has_js_module", False)
 
-    # ✅ Always treat JS-heavy pages as js_scrape
+    # Prefer JS-scrape for JS-heavy pages
     if has_js_module:
         return "js_scrape"
 
@@ -172,11 +256,9 @@ def detect_quiz_type(quiz_info: Dict[str, Any]) -> str:
     Choose one of: js_scrape, api, data_csv, visualization, text_reasoning
     """
     raw = call_llm(prompt.strip(), system="Classifier")
-    label = raw.strip().split()[0].lower()
-
+    label = _clean_label(raw)
     if label not in {"js_scrape", "api", "data_csv", "visualization", "text_reasoning"}:
         return "text_reasoning"
-
     return label
 
 
@@ -222,7 +304,6 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     text = q_div.get_text(" ", strip=True) if q_div else soup.get_text(" ", strip=True)
 
     if not text:
-        # At least this is a clear error, not a Playwright stack trace
         raise ValueError("JS-rendered page has no visible text")
 
     # Try obvious "secret/code" pattern
@@ -239,7 +320,8 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
     Respond ONLY with the answer value.
     """
     answer = call_llm(prompt.strip(), system="Answer extractor")
-    return answer.strip().splitlines()[0].strip()
+    return sanitize_answer(answer)
+
 
 async def solve_api_quiz(quiz_info: Dict[str, Any]) -> Any:
     text = quiz_info.get("question_text", "")
@@ -307,7 +389,7 @@ async def solve_text_reasoning_quiz(quiz_info: Dict[str, Any]) -> Any:
     """
     answer = call_llm(prompt.strip(), system="Quiz solver")
 
-    return answer.strip().splitlines()[0].strip()
+    return sanitize_answer(answer)
 
 
 # ==========================================================
@@ -319,8 +401,16 @@ def submit_answer(
     secret: str,
     quiz_url: str,
     answer: Any,
-    submission_url: str
+    submission_url: str,
+    timeout: int = 20,
 ) -> Dict[str, Any]:
+    """
+    Send the answer payload to the submission endpoint and return parsed JSON.
+    Returns a structured dict with keys: correct (bool), url (next URL or None), reason (str).
+    On network failure, returns a structured error dict instead of raising.
+    """
+    # Ensure submission_url is absolute relative to quiz_url
+    submission_url = urljoin(quiz_url, submission_url)
 
     payload = {
         "email": email,
@@ -329,7 +419,13 @@ def submit_answer(
         "answer": answer,
     }
 
-    response = requests.post(submission_url, json=payload, timeout=20)
-    response.raise_for_status()
+    try:
+        resp = retry_post(submission_url, json_payload=payload, retries=2, backoff=1.0, timeout=timeout)
+    except Exception as e:
+        return {"correct": False, "url": None, "reason": f"network_error: {str(e)}"}
 
-    return response.json()
+    # Parse JSON response
+    try:
+        return resp.json()
+    except ValueError:
+        return {"correct": False, "url": None, "reason": "invalid_json_response"}
