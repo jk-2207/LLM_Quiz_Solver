@@ -404,26 +404,266 @@ Respond with valid JSON only and nothing else.
         return cleaned
 
 async def solve_data_quiz(quiz_info: Dict[str, Any]) -> Any:
-    text = quiz_info.get("question_text", "")
-    match = re.search(r"(https?://\S+\.csv)", text)
+    """
+    Improved CSV solver.
 
+    Strategy:
+    - Look for CSV URL in question text.
+    - Load CSV using your load_csv_from_url helper (returns a pandas.DataFrame).
+    - Try simple heuristics to detect operations (sum, mean, median, count, max, min, groupby).
+    - If heuristics fail, ask the LLM for a tiny JSON plan and execute it.
+    - Return the computed scalar or a compact JSON result when appropriate.
+    """
+    import json
+    from pandas.api.types import is_numeric_dtype
+
+    text = (quiz_info.get("question_text") or "").strip()
+    if not text:
+        raise ValueError("Empty question text for data quiz.")
+
+    # 1) find CSV URL
+    match = re.search(r"(https?://\S+?\.csv)(?:\s|$)", text, re.IGNORECASE)
     if not match:
         raise ValueError("No CSV URL found in question.")
-
     csv_url = match.group(1)
-    df = load_csv_from_url(csv_url)
 
-    prompt = f"""
-    Dataset columns: {list(df.columns)}
+    # 2) load CSV
+    try:
+        df = load_csv_from_url(csv_url)
+    except Exception as e:
+        raise ValueError(f"Failed to load CSV: {e}")
 
-    Question: {text}
+    if df is None or df.empty:
+        raise ValueError("Loaded CSV is empty or unreadable.")
 
-    Suggest pandas steps to compute answer.
-    """
-    plan = call_llm(prompt.strip(), system="Data planner")
+    # helper to pick a likely numeric column if none provided
+    def _pick_numeric_column():
+        for c in df.columns:
+            if is_numeric_dtype(df[c]):
+                return c
+        return None
 
-    raise ValueError(f"CSV solver not implemented yet. Plan suggestion: {plan}")
+    # 3) simple heuristics
+    lower = text.lower()
 
+    # group-by pattern: "group by <col> sum <col2>" or "sum <col2> by <col>"
+    gb_match = re.search(r"(?:group by|groupby)\s+([A-Za-z0-9_ -]+).*?(?:sum|total|aggregate)\s+([A-Za-z0-9_ -]+)", lower)
+    if gb_match:
+        col_group = gb_match.group(1).strip()
+        col_value = gb_match.group(2).strip()
+        # try to map to actual column names (case-insensitive)
+        def _map_col(name):
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    return c
+            return None
+        cg = _map_col(col_group)
+        cv = _map_col(col_value)
+        if cg and cv:
+            try:
+                res = df.groupby(cg)[cv].sum().to_dict()
+                return sanitize_answer(json.dumps(res))
+            except Exception as e:
+                raise ValueError(f"groupby failed: {e}")
+
+    # sum / total of a column
+    sum_match = re.search(r"(?:sum|total|add|sum of)\s+([A-Za-z0-9_ -]+)", lower)
+    if sum_match:
+        col_name = sum_match.group(1).strip()
+        # map to actual column
+        col = None
+        for c in df.columns:
+            if c.lower() == col_name.lower() or col_name.lower() in c.lower():
+                col = c
+                break
+        if not col:
+            # fallback: pick a numeric column
+            col = _pick_numeric_column()
+        if not col:
+            raise ValueError("No numeric column available for sum.")
+        try:
+            val = df[col].sum()
+            return sanitize_answer(str(val))
+        except Exception as e:
+            raise ValueError(f"sum failed: {e}")
+
+    # mean / average
+    if "mean" in lower or "average" in lower:
+        # try to detect column
+        mean_match = re.search(r"(?:mean|average|avg)\s+of\s+([A-Za-z0-9_ -]+)", lower)
+        col = None
+        if mean_match:
+            name = mean_match.group(1).strip()
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    col = c
+                    break
+        if not col:
+            col = _pick_numeric_column()
+        if not col:
+            raise ValueError("No numeric column available for mean.")
+        try:
+            val = df[col].mean()
+            return sanitize_answer(str(val))
+        except Exception as e:
+            raise ValueError(f"mean failed: {e}")
+
+    # median
+    if "median" in lower:
+        med_match = re.search(r"median\s+of\s+([A-Za-z0-9_ -]+)", lower)
+        col = None
+        if med_match:
+            name = med_match.group(1).strip()
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    col = c
+                    break
+        if not col:
+            col = _pick_numeric_column()
+        if not col:
+            raise ValueError("No numeric column available for median.")
+        try:
+            val = df[col].median()
+            return sanitize_answer(str(val))
+        except Exception as e:
+            raise ValueError(f"median failed: {e}")
+
+    # count rows or count distinct
+    if re.search(r"\b(count|how many|number of|rows)\b", lower):
+        # distinct pattern: "count distinct <col>"
+        distinct_match = re.search(r"(?:count distinct|distinct count)\s+([A-Za-z0-9_ -]+)", lower)
+        if distinct_match:
+            name = distinct_match.group(1).strip()
+            col = None
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    col = c
+                    break
+            if not col:
+                raise ValueError("Requested distinct count but column not found.")
+            try:
+                val = df[col].nunique()
+                return sanitize_answer(str(val))
+            except Exception as e:
+                raise ValueError(f"distinct count failed: {e}")
+        # otherwise total rows
+        return sanitize_answer(str(len(df)))
+
+    # max / min
+    if "max" in lower or "maximum" in lower:
+        # detect column
+        m = re.search(r"(?:max|maximum)\s+of\s+([A-Za-z0-9_ -]+)", lower)
+        col = None
+        if m:
+            name = m.group(1).strip()
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    col = c
+                    break
+        if not col:
+            col = _pick_numeric_column()
+        if not col:
+            raise ValueError("No numeric column for max.")
+        try:
+            val = df[col].max()
+            return sanitize_answer(str(val))
+        except Exception as e:
+            raise ValueError(f"max failed: {e}")
+
+    if "min" in lower or "minimum" in lower:
+        m = re.search(r"(?:min|minimum)\s+of\s+([A-Za-z0-9_ -]+)", lower)
+        col = None
+        if m:
+            name = m.group(1).strip()
+            for c in df.columns:
+                if c.lower() == name.lower() or name.lower() in c.lower():
+                    col = c
+                    break
+        if not col:
+            col = _pick_numeric_column()
+        if not col:
+            raise ValueError("No numeric column for min.")
+        try:
+            val = df[col].min()
+            return sanitize_answer(str(val))
+        except Exception as e:
+            raise ValueError(f"min failed: {e}")
+
+    # 4) If heuristics failed, ask LLM for a tiny JSON plan
+    llm_prompt = f"""
+You are a helpful data assistant. Given the CSV available at: {csv_url}
+Question: {text}
+
+Return a tiny JSON object (and ONLY the JSON) describing what to compute. Example:
+{{"operation":"sum", "column":"Sales", "filter": "Region=='APAC'"}}
+Allowed operations: sum, mean, median, count, distinct_count, max, min, groupby_sum
+If you propose groupby_sum use keys: "groupby":"ColumnA", "agg":"ColumnB"
+
+Respond with valid JSON only.
+"""
+    raw = call_llm(llm_prompt.strip(), system="Data planner (json)")
+    cleaned = sanitize_answer(raw)
+
+    try:
+        plan = json.loads(cleaned)
+    except Exception:
+        # cannot parse LLM output
+        raise ValueError("LLM returned unparseable plan for CSV. Plan text: " + cleaned)
+
+    # Execute the plan
+    op = plan.get("operation")
+    try:
+        if op == "sum":
+            col = plan.get("column") or _pick_numeric_column()
+            if col not in df.columns:
+                # try fuzzy match
+                for c in df.columns:
+                    if c.lower() == col.lower() or (col and col.lower() in c.lower()):
+                        col = c
+                        break
+            if col is None:
+                raise ValueError("No column found for sum")
+            return sanitize_answer(str(df[col].sum()))
+
+        if op == "mean":
+            col = plan.get("column") or _pick_numeric_column()
+            return sanitize_answer(str(df[col].mean()))
+
+        if op == "median":
+            col = plan.get("column") or _pick_numeric_column()
+            return sanitize_answer(str(df[col].median()))
+
+        if op == "count":
+            if plan.get("column"):
+                col = plan["column"]
+                return sanitize_answer(str(int(df[col].count())))
+            return sanitize_answer(str(len(df)))
+
+        if op == "distinct_count":
+            col = plan.get("column")
+            return sanitize_answer(str(int(df[col].nunique())))
+
+        if op == "max":
+            col = plan.get("column") or _pick_numeric_column()
+            return sanitize_answer(str(df[col].max()))
+
+        if op == "min":
+            col = plan.get("column") or _pick_numeric_column()
+            return sanitize_answer(str(df[col].min()))
+
+        if op == "groupby_sum":
+            g = plan.get("groupby")
+            agg = plan.get("agg")
+            if not g or not agg:
+                raise ValueError("groupby_sum requires 'groupby' and 'agg'")
+            res = df.groupby(g)[agg].sum().to_dict()
+            import json as _json
+            return sanitize_answer(_json.dumps(res))
+
+        # Unknown op
+        raise ValueError(f"Unknown operation requested by plan: {op}")
+    except Exception as e:
+        raise ValueError(f"Failed to execute plan: {e}")
 
 async def solve_visualization_quiz(quiz_info: Dict[str, Any]) -> Any:
     text = quiz_info.get("question_text", "")
