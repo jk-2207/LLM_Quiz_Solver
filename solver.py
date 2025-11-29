@@ -35,20 +35,23 @@ def _clean_label(raw: str) -> str:
 def sanitize_answer(ans: Optional[str]) -> str:
     """
     Normalize LLM outputs to a concise final answer string.
+    - Remove <think>...</think> blocks
     - Take the first non-empty line.
     - Strip common prefixes like "answer is".
     - Remove surrounding quotes.
     """
     if not ans:
         return ""
-    s = str(ans).strip()
+    s = str(ans)
+    # remove any <think>...</think> or similar blocks
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE)
+    s = s.strip()
     lines = [l.strip() for l in s.splitlines() if l.strip()]
     if not lines:
         return ""
     first = lines[0]
     # Remove common prefixes
     first = re.sub(r'(?i)^(answer[:\s-]*|the answer (is|:)\s*)', '', first).strip()
-    # Remove enclosing quotes or stray punctuation
     first = first.strip().strip('"\'' )
     return first
 
@@ -324,20 +327,81 @@ async def solve_js_scrape(quiz_info: Dict[str, Any]) -> Any:
 
 
 async def solve_api_quiz(quiz_info: Dict[str, Any]) -> Any:
-    text = quiz_info.get("question_text", "")
-
-    prompt = f"""
-    You are planning an API-based solution.
-
-    Question:
-    {text}
-
-    Describe expected API endpoint + final answer type.
     """
-    plan = call_llm(prompt.strip(), system="API planner")
+    Attempt to solve API-style quizzes.
+    Strategy:
+    1. Look for explicit API URL in question_text (regex).
+    2. If found, call it (fetch_api_json) and return sensible value (string/number/json).
+    3. If not found, inspect the rendered page (try render_with_js) for example endpoint/headers.
+    4. If still nothing, ask the LLM but instruct it to return ONLY the final answer (JSON/plain).
+    """
+    text = quiz_info.get("question_text", "") or ""
+    url = quiz_info.get("url")
 
-    raise ValueError(f"API solver not implemented yet. Plan suggestion: {plan}")
+    # 1) quick regex for obvious API URLs in the question text
+    m = re.search(r"(https?://[^\s'\"<>{}]+/[^)\s'\"<>{}]+)", text)
+    if m:
+        candidate = m.group(1)
+        # If it looks like an API endpoint (has 'api' or ends with /json etc.), try it
+        if "api" in candidate.lower() or candidate.lower().endswith((".json", "/data")):
+            try:
+                data = fetch_api_json(candidate)
+                # If it's a simple JSON with result key, prefer it; otherwise return full JSON
+                if isinstance(data, dict):
+                    # prefer 'answer' or 'result' keys if present
+                    for k in ("answer", "result", "data", "value"):
+                        if k in data:
+                            return sanitize_answer(str(data[k]))
+                return sanitize_answer(str(data))
+            except Exception as e:
+                # fallthrough to LLM planning if direct call failed
+                pass
 
+    # 2) try rendering page (JS) to find endpoint examples / headers
+    try:
+        rendered = await render_with_js(url)
+        soup = BeautifulSoup(rendered, "html.parser")
+        page_text = soup.get_text(" ", strip=True)
+        # look for obvious example endpoints in page text
+        m2 = re.search(r"https?://[^\s'\"<>{}]+/submit[^\s'\"<>]*", page_text)
+        if m2:
+            candidate = m2.group(0)
+            try:
+                data = fetch_api_json(candidate)
+                if isinstance(data, dict):
+                    for k in ("answer","result","data","value"):
+                        if k in data:
+                            return sanitize_answer(str(data[k]))
+                return sanitize_answer(str(data))
+            except Exception:
+                pass
+    except Exception:
+        # rendering failed — no big deal, fallback to LLM
+        pass
+
+    # 3) fallback: ask the LLM but force a strict output format
+    llm_prompt = f"""
+You are an assistant that must *only* answer with the final result (no explanation).
+The user asked: {text}
+If you need to propose an API endpoint, return a compact JSON object describing:
+{{"endpoint":"<url>", "method":"GET/POST", "headers":{{...}} , "answer_type":"number|string|json", "example_answer": "<the final answer>" }}
+Respond with valid JSON only and nothing else.
+"""
+    raw = call_llm(llm_prompt.strip(), system="API planner (strict)")
+    # sanitize then try to parse JSON
+    cleaned = sanitize_answer(raw)
+    # try to extract JSON
+    try:
+        import json
+        parsed = json.loads(cleaned)
+        # if we have example_answer, return it
+        if isinstance(parsed, dict) and "example_answer" in parsed:
+            return sanitize_answer(str(parsed["example_answer"]))
+        # otherwise return the whole JSON as string
+        return sanitize_answer(str(parsed))
+    except Exception:
+        # if parsing failed, just return the sanitized string (best-effort)
+        return cleaned
 
 async def solve_data_quiz(quiz_info: Dict[str, Any]) -> Any:
     text = quiz_info.get("question_text", "")
