@@ -85,6 +85,9 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
     MAX_TIME = 170
     MAX_QUIZZES = 20
 
+    if history and history[-1].get("reason"):
+        quiz_info["reason"] = history[-1]["reason"]
+    
     while current_url:
         if time.time() - start_time > MAX_TIME:
             return {"status": "timeout", "solved": solved, "history": history}
@@ -124,6 +127,8 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
             answer=answer,
             submission_url=quiz_info["submission_url"],
         )
+        next_reason = resp.get("reason")
+
 
         history.append({
             "url": current_url,
@@ -140,6 +145,7 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
         if not next_url:
             break
 
+        quiz_info["next_reason"] = next_reason
         current_url = next_url
 
     return {"status": "completed", "solved": solved, "history": history}
@@ -228,17 +234,15 @@ def parse_quiz_page(html: str, url: str) -> Dict[str, Any]:
         path_prefix = m3.group(1)
 
     return {
-        "url": url,
-        "email": email,
-        "question_text": question_text,
-        "has_js_module": has_js_module,
-        "submission_url": submission_url,
-        "audio_url": audio_url,
-        "image_url": image_url,
-        "csv_url": csv_url,
-        "repo_url": repo_url,
-        "path_prefix": path_prefix,
-    }
+    "url": url,
+    "email": email,
+    "question_text": question_text,
+    "has_js_module": has_js_module,
+    "submission_url": submission_url,
+
+    # placeholder for reeval expected-answer hints
+    "reason": None,
+}
 
 
 # ==========================================================
