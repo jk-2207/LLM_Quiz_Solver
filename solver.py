@@ -85,9 +85,6 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
     MAX_TIME = 170
     MAX_QUIZZES = 20
 
-    if history and history[-1].get("reason"):
-        quiz_info["reason"] = history[-1]["reason"]
-    
     while current_url:
         if time.time() - start_time > MAX_TIME:
             return {"status": "timeout", "solved": solved, "history": history}
@@ -127,8 +124,6 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
             answer=answer,
             submission_url=quiz_info["submission_url"],
         )
-        next_reason = resp.get("reason")
-
 
         history.append({
             "url": current_url,
@@ -145,7 +140,6 @@ async def solve_quiz_chain(start_url: str, email: str, secret: str) -> Dict[str,
         if not next_url:
             break
 
-        quiz_info["next_reason"] = next_reason
         current_url = next_url
 
     return {"status": "completed", "solved": solved, "history": history}
@@ -234,15 +228,17 @@ def parse_quiz_page(html: str, url: str) -> Dict[str, Any]:
         path_prefix = m3.group(1)
 
     return {
-    "url": url,
-    "email": email,
-    "question_text": question_text,
-    "has_js_module": has_js_module,
-    "submission_url": submission_url,
-
-    # placeholder for reeval expected-answer hints
-    "reason": None,
-}
+        "url": url,
+        "email": email,
+        "question_text": question_text,
+        "has_js_module": has_js_module,
+        "submission_url": submission_url,
+        "audio_url": audio_url,
+        "image_url": image_url,
+        "csv_url": csv_url,
+        "repo_url": repo_url,
+        "path_prefix": path_prefix,
+    }
 
 
 # ==========================================================
@@ -1166,234 +1162,374 @@ except Exception:
 # -----------------------------
 # END: Project2 auto-handler upgrade
 # -----------------------------
+# -----------------------------
+# APPEND: Project2 robust handlers v2 (append-only)
+# -----------------------------
+import asyncio
+import time
+from urllib.parse import urlparse, urljoin
+import math
 
-# ==========================================================
-# APPEND: Deterministic handlers for Project2 REEVALS
-# ==========================================================
-
-def _reeval_extract_expected(text: str) -> Optional[str]:
-    """
-    Extract exact expected answer from phrases like:
-    - 'Submit: ...'
-    - 'should be: ...'
-    - 'Use: ...'
-    """
-    patterns = [
-        r"submit:\s*(.+)",
-        r"should be:\s*(.+)",
-        r"use:\s*(.+)",
-        r"command should be:\s*(.+)",
-        r"header should be:\s*(.+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+# small helper to try requests with retries
+def _http_get_bytes(url: str, timeout: int = 15, retries: int = 2, backoff: float = 0.5) -> Optional[bytes]:
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            logger.info("Trying URL: %s (attempt %d)", url, attempt + 1)
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            last = e
+            logger.warning("Failed to GET %s (attempt %d): %s", url, attempt + 1, e)
+            time.sleep(backoff * (2 ** attempt))
+    logger.error("All attempts failed for %s: %s", url, last)
     return None
 
+# Return list of asset candidate URLs (logs, audio, image, csv)
+def _project2_candidate_urls(base_url: str, rel_paths: List[str]) -> List[str]:
+    base = urlparse(base_url)
+    root = f"{base.scheme}://{base.netloc}"
+    candidates = []
+    for p in rel_paths:
+        if p.startswith("http://") or p.startswith("https://"):
+            candidates.append(p)
+        else:
+            candidates.append(urljoin(root, p))
+    return candidates
 
-def _reeval_simple_compute(text: str) -> Optional[Any]:
-    """
-    Handle simple numeric / decoding tasks explicitly mentioned.
-    """
-    # Base64 decode
-    if "base64" in text.lower() and "decode" in text.lower():
-        m = re.search(r"decode\s*[:\-]?\s*([A-Za-z0-9+/=]+)", text)
-        if m:
-            import base64
+# Robust transcribe: try audio_url, then candidates, return lowercase phrase or empty
+async def project2_transcribe_auto(quiz_info: Dict[str, Any]) -> str:
+    audio_url = quiz_info.get("audio_url")
+    candidates = []
+    if audio_url:
+        candidates.append(audio_url)
+    # common audio names
+    candidates += [
+        "/project2/audio-passphrase.opus",
+        "/project2/audio-passphrase.wav",
+        "/project2/audio-passphrase.mp3",
+        "/project2/audio.opus",
+        "/project2/audio.wav",
+    ]
+    tried = _project2_candidate_urls(quiz_info.get("url",""), candidates)
+    for u in tried:
+        b = await asyncio.to_thread(_http_get_bytes, u)
+        if not b:
+            continue
+        # try transcribe using existing helper if available
+        try:
+            txt = await asyncio.to_thread(project2_transcribe_audio, u)
+            if txt:
+                logger.info("Transcription success from %s -> %r", u, txt)
+                return txt.strip().lower()
+        except Exception:
+            logger.exception("project2_transcribe_audio raised for %s", u)
+        # last resort: if whisper local installed, try from bytes (write tempfile inside helper)
+        try:
+            import whisper, tempfile, os
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".opus")
+            tmp.write(b); tmp.close()
+            model = whisper.load_model("small")
+            res = model.transcribe(tmp.name)
             try:
-                return base64.b64decode(m.group(1)).decode("utf-8")
+                os.unlink(tmp.name)
             except Exception:
                 pass
+            text = (res.get("text") or "").strip().lower()
+            if text:
+                logger.info("Whisper transcribed %s -> %r", u, text)
+                return text
+        except Exception:
+            pass
+    return ""
 
-    # Count users age > 18
-    if "count users" in text.lower() and "age > 18" in text.lower():
-        return 2  # as per dataset used in reevaluation
-
-    # Sum problems
-    m = re.search(r"sum should be\s*(\d+)", text.lower())
-    if m:
-        return int(m.group(1))
-
-    # Explicit totals
-    m = re.search(r"total .* sum should be\s*(\d+)", text.lower())
-    if m:
-        return int(m.group(1))
-
-    return None
-
-
-async def compute_answer_reevals(quiz_info: Dict[str, Any]) -> Optional[Any]:
-    """
-    Deterministic solver for /project2-reevals*
-    """
-    url = quiz_info.get("url", "")
-    if "/project2-reevals" not in url:
-        return None
-
-    text = quiz_info.get("question_text", "")
-    lower = text.lower()
-
-    # 1. Direct expected answer extraction
-    expected = _reeval_extract_expected(text)
-    if expected:
-        return expected
-
-    # 2. Simple deterministic compute
-    simple = _reeval_simple_compute(text)
-    if simple is not None:
-        return simple
-
-    # 3. JSON array explicitly required
-    if "answer must be a json array" in lower:
-        return []
-
-    # 4. Count endpoints with status 200
-    if "count endpoints" in lower and "200" in lower:
-        return 3  # reevaluation dataset fixed
-
-    # 5. gzip request id
-    if "gzip" in lower and "request id" in lower:
-        return "req-3"
-
-    # 6. API key literal
-    if "api key should be" in lower:
-        m = re.search(r"api key should be\s*([^\s]+)", text, re.I)
-        if m:
-            return m.group(1)
-
-    # Fallback: last number in text
-    nums = re.findall(r"\b\d+\b", text)
-    if nums:
-        return int(nums[-1])
-
-    return None
-
-
-# --------------------------
-# Rebind compute_answer again
-# --------------------------
-try:
-    _orig_compute_answer_v2 = compute_answer
-except Exception:
-    _orig_compute_answer_v2 = None
-
-
-async def compute_answer(quiz_info: Dict[str, Any]) -> Any:
-    # REEVALS FIRST (no LLM)
-    try:
-        reeval = await compute_answer_reevals(quiz_info)
-        if reeval is not None:
-            return reeval
-    except Exception:
-        logger.exception("REEVAL handler failed")
-
-    # fallback to previous pipeline
-    if _orig_compute_answer_v2:
-        return await _orig_compute_answer_v2(quiz_info)
-
-    raise RuntimeError("No compute_answer available")
-
-# ==========================================================
-# END APPEND
-# ==========================================================
-# ==========================================================
-# APPEND FIX: Project2 REEVALS – use evaluator "reason" field
-# ==========================================================
-
-def _reeval_extract_from_reason(reason: Optional[str]) -> Optional[Any]:
-    """
-    Extract the exact expected answer from the evaluator-provided `reason` field.
-    This is the most reliable source for reevals.
-    """
-    if not reason:
-        return None
-
-    r = reason.strip()
-
-    patterns = [
-        r"Submit:\s*(.+)",
-        r"should be:\s*(.+)",
-        r"Use:\s*(.+)",
-        r"Command should be:\s*(.+)",
-        r"Header should be:\s*(.+)",
-        r"Decoded string should be:\s*(.+)",
+# Robust image dominant hex: try image_url then candidates
+async def project2_image_hex_auto(quiz_info: Dict[str, Any]) -> str:
+    img_url = quiz_info.get("image_url")
+    candidates = []
+    if img_url:
+        candidates.append(img_url)
+    candidates += [
+        "/project2-heatmap.png",
+        "/project2/heatmap.png",
+        "/project2/heatmap.jpg",
+        "/project2/heatmap.jpeg",
     ]
+    tried = _project2_candidate_urls(quiz_info.get("url",""), candidates)
+    for u in tried:
+        b = await asyncio.to_thread(_http_get_bytes, u)
+        if not b:
+            continue
+        try:
+            # try existing helper
+            hexc = await asyncio.to_thread(project2_dominant_hex, u)
+            if hexc:
+                logger.info("Dominant hex from %s -> %s", u, hexc)
+                return hexc.lower()
+        except Exception:
+            logger.exception("project2_dominant_hex failed for %s", u)
+        # fallback local compute from bytes
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(b)).convert("RGB")
+            img = img.resize((200,200))
+            pixels = list(img.getdata())
+            from collections import Counter
+            most = Counter(pixels).most_common(1)
+            if most:
+                r_,g_,b_ = most[0][0]
+                hexc = '#{:02x}{:02x}{:02x}'.format(r_,g_,b_)
+                logger.info("Local computed dominant hex %s from %s", hexc, u)
+                return hexc.lower()
+        except Exception:
+            logger.exception("Local image hex compute failed for %s", u)
+    return ""
 
-    for pat in patterns:
-        m = re.search(pat, r, flags=re.IGNORECASE)
+# Robust CSV JSON: try csv_url and candidate filenames under root
+async def project2_csv_auto(quiz_info: Dict[str, Any]) -> str:
+    csv_url = quiz_info.get("csv_url")
+    candidates = []
+    if csv_url:
+        candidates.append(csv_url)
+    candidates += [
+        "/project2/data.csv",
+        "/project2/dataset.csv",
+        "/project2/project2-data.csv",
+        "/project2/data.csv?raw=true",
+    ]
+    tried = _project2_candidate_urls(quiz_info.get("url",""), candidates)
+    for u in tried:
+        b = await asyncio.to_thread(_http_get_bytes, u)
+        if not b:
+            continue
+        try:
+            # try helper
+            js = await asyncio.to_thread(project2_csv_to_json_array, u)
+            import json as _json
+            parsed = _json.loads(js)
+            if isinstance(parsed, list):
+                logger.info("CSV -> JSON array from %s (len=%d)", u, len(parsed))
+                return js
+        except Exception:
+            # fallback simple parse from bytes
+            try:
+                import pandas as pd, io, json as _json
+                df = pd.read_csv(io.StringIO(b.decode('utf-8')))
+                df.columns = [c.strip() for c in df.columns]
+                for c in df.select_dtypes(include=['object']).columns:
+                    df[c] = df[c].astype(str).str.strip()
+                js = _json.dumps(df.to_dict(orient='records'), ensure_ascii=False)
+                logger.info("CSV parsed fallback from %s (len=%d)", u, len(df))
+                return js
+            except Exception:
+                logger.exception("Failed to parse CSV from %s", u)
+    return "[]"
+
+# Robust GH tree: try repo_url & path_prefix or try candidates
+async def project2_gh_tree_auto(quiz_info: Dict[str, Any]) -> Optional[int]:
+    repo = quiz_info.get("repo_url")
+    prefix = quiz_info.get("path_prefix") or ""
+    if not repo:
+        # try to discover common repo candidates from page
+        page_html = await asyncio.to_thread(fetch_html, quiz_info.get("url",""))
+        m = re.search(r"(https?://github.com/[\w\-/]+)", page_html)
         if m:
-            return m.group(1).strip()
-
-    return None
-
-
-async def compute_answer_reevals(quiz_info: Dict[str, Any]) -> Optional[Any]:
-    """
-    FINAL deterministic solver for /project2-reevals*
-    Priority:
-    1. Extract exact expected answer from evaluator `reason`
-    2. Handle known fixed-value tasks
-    3. NEVER fall back to numeric guessing
-    """
-    url = quiz_info.get("url", "")
-    if "/project2-reevals" not in url:
+            repo = m.group(1)
+    if not repo:
+        return None
+    try:
+        cnt = await asyncio.to_thread(project2_count_md_files_github_tree, repo, prefix)
+        offset = len((quiz_info.get("email") or "")) % 2
+        logger.info("GH tree count %d offset %d", cnt, offset)
+        return int(cnt + offset)
+    except Exception:
+        logger.exception("project2_gh_tree_auto failed for %s %s", repo, prefix)
         return None
 
-    # 🔥 MOST IMPORTANT: use evaluator reason
-    reason = quiz_info.get("reason")
-    extracted = _reeval_extract_from_reason(reason)
-    if extracted is not None:
-        return extracted
-
-    text = (quiz_info.get("question_text") or "").lower()
-
-    # Fixed deterministic cases
-    if "count users with age > 18" in text:
-        return 2
-
-    if "sum should be 273" in text:
-        return 273
-
-    if "total sales sum should be 852" in text:
-        return 852
-
-    if "count endpoints with status 200" in text:
-        return 3
-
-    if "gzip" in text and "request id" in text:
-        return "req-3"
-
-    if "answer must be a json array" in text:
-        return []
-
-    # ❌ DO NOT guess numbers for reevals
+# project2 logs handler: attempt download and compute sum of 'download' bytes, add offset (mod 5)
+async def project2_logs_auto(quiz_info: Dict[str, Any]) -> Optional[int]:
+    # candidate log URLs
+    candidates = [
+        "/project2/logs.json",
+        "/project2-logs",
+        "/project2/logs",
+        "/project2/logs.txt",
+        "/project2/logs.jsonl",
+    ]
+    tried = _project2_candidate_urls(quiz_info.get("url",""), candidates)
+    for u in tried:
+        b = await asyncio.to_thread(_http_get_bytes, u)
+        if not b:
+            continue
+        try:
+            # try parse as JSON array of events with {event, bytes}
+            import json as _json
+            text = b.decode('utf-8', errors='ignore')
+            parsed = _json.loads(text)
+            total = 0
+            if isinstance(parsed, list):
+                for ev in parsed:
+                    if isinstance(ev, dict) and ev.get("event") == "download":
+                        val = ev.get("bytes") or ev.get("size") or 0
+                        try:
+                            total += int(val)
+                        except Exception:
+                            continue
+                offset = len((quiz_info.get("email") or "")) % 5
+                logger.info("Logs sum %d + offset %d from %s", total, offset, u)
+                return int(total + offset)
+        except Exception:
+            # try text lines 'download <bytes>'
+            try:
+                text = b.decode('utf-8', errors='ignore')
+                total = 0
+                for line in text.splitlines():
+                    if "download" in line.lower():
+                        # find number in line
+                        m = re.search(r"(\d{1,})", line)
+                        if m:
+                            total += int(m.group(1))
+                offset = len((quiz_info.get("email") or "")) % 5
+                if total > 0:
+                    return int(total + offset)
+            except Exception:
+                logger.exception("project2_logs_auto parse failed for %s", u)
     return None
 
+# project2 invoice: compute sum of line items to 2 decimals
+async def project2_invoice_auto(quiz_info: Dict[str, Any]) -> Optional[str]:
+    # candidate URLs
+    candidates = [
+        "/project2/invoice.json",
+        "/project2-invoice",
+        "/project2/invoice",
+        "/project2/invoice.jsonl"
+    ]
+    tried = _project2_candidate_urls(quiz_info.get("url",""), candidates)
+    for u in tried:
+        b = await asyncio.to_thread(_http_get_bytes, u)
+        if not b:
+            continue
+        try:
+            import json as _json
+            txt = b.decode('utf-8', errors='ignore')
+            parsed = _json.loads(txt)
+            # expect list of line items with 'amount' or 'price' fields
+            if isinstance(parsed, dict) and parsed.get("line_items"):
+                items = parsed.get("line_items", [])
+            elif isinstance(parsed, list):
+                items = parsed
+            else:
+                items = []
+            total = 0.0
+            for it in items:
+                if isinstance(it, dict):
+                    val = it.get("amount") or it.get("price") or it.get("total") or 0
+                    try:
+                        total += float(val)
+                    except Exception:
+                        continue
+            # format to two decimals
+            return f"{total:.2f}"
+        except Exception:
+            logger.exception("project2_invoice_auto parse failed for %s", u)
+    return None
 
-# --------------------------
-# FINAL rebind (reevals win)
-# --------------------------
+# Rewire compute_answer_auto to call the more robust implementations and avoid LLM fallbacks
 try:
-    _orig_compute_answer_final = compute_answer
+    _previous_compute_answer_auto = compute_answer_auto  # preserve if exists
 except Exception:
-    _orig_compute_answer_final = None
+    _previous_compute_answer_auto = None
 
+async def compute_answer_auto(quiz_info: Dict[str, Any]) -> Optional[Any]:
+    # Try previously-defined auto first (if present)
+    if _previous_compute_answer_auto is not None:
+        try:
+            res = await _previous_compute_answer_auto(quiz_info)
+            if res is not None:
+                return res
+        except Exception:
+            logger.exception("previous compute_answer_auto failed")
 
-async def compute_answer(quiz_info: Dict[str, Any]) -> Any:
-    # REEVALS FIRST — NO LLM, NO GUESSING
+    url = quiz_info.get("url","") or ""
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    lower_text = (quiz_info.get("question_text") or "").lower()
+
+    # handle audio
+    if "/project2-audio-passphrase" in path or "audio-passphrase" in lower_text:
+        txt = await project2_transcribe_auto(quiz_info)
+        if txt:
+            return txt  # lowercase phrase
+        # if transcription failed, return empty string rather than falling back to LLM
+        return ""
+
+    # handle heatmap
+    if "/project2-heatmap" in path or "heatmap" in lower_text:
+        hexc = await project2_image_hex_auto(quiz_info)
+        if hexc:
+            return hexc
+        return ""
+
+    # handle csv
+    if "/project2-csv" in path or "csv" in lower_text:
+        js = await project2_csv_auto(quiz_info)
+        return js
+
+    # handle gh-tree
+    if "/project2-gh-tree" in path or "gh-tree" in lower_text:
+        ghv = await project2_gh_tree_auto(quiz_info)
+        if ghv is not None:
+            return int(ghv)
+        return None
+
+    # handle logs
+    if "/project2-logs" in path or "logs" in lower_text:
+        val = await project2_logs_auto(quiz_info)
+        if val is not None:
+            return int(val)
+        return None
+
+    # handle invoice
+    if "/project2-invoice" in path or "invoice" in lower_text:
+        inv = await project2_invoice_auto(quiz_info)
+        if inv is not None:
+            return inv
+        return None
+
+    # fallback to older deterministic handler if present
     try:
-        reeval = await compute_answer_reevals(quiz_info)
-        if reeval is not None:
-            return reeval
+        if _previous_compute_answer_auto is not None:
+            res = await _previous_compute_answer_auto(quiz_info)
+            if res is not None:
+                return res
     except Exception:
-        logger.exception("Final REEVAL handler failed")
+        pass
 
-    if _orig_compute_answer_final:
-        return await _orig_compute_answer_final(quiz_info)
+    return None
 
-    raise RuntimeError("No compute_answer available")
+# rebind compute_answer wrapper to honor new compute_answer_auto
+try:
+    if '_orig_compute_answer' in globals() and _orig_compute_answer is not None:
+        async def compute_answer(quiz_info: Dict[str, Any]) -> Any:
+            try:
+                proj_res = await compute_answer_auto(quiz_info)
+                if proj_res is not None:
+                    return proj_res
+            except Exception:
+                logger.exception("compute_answer_auto (v3) failed")
+            return await _orig_compute_answer(quiz_info)
+    else:
+        async def compute_answer(quiz_info: Dict[str, Any]) -> Any:
+            proj_res = await compute_answer_auto(quiz_info)
+            if proj_res is not None:
+                return proj_res
+            raise RuntimeError("No original compute_answer and compute_answer_auto could not handle page")
+except Exception:
+    logger.exception("Failed to rebind compute_answer to compute_answer_auto (v3)")
 
-# ==========================================================
-# END FIX
-# ==========================================================
+# -----------------------------
+# END APPEND
+# -----------------------------
